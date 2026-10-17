@@ -1,0 +1,23 @@
+{
+  "name": "netmon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NetMon - local network and internet monitoring dashboard (Node + Vue 3 + Tailwind CSS)",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:mock": "concurrently -k -n server,web -c blue,green \"npm:dev:server:mock\" \"npm:dev:web\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:server:mock": "NETMON_MOCK=1 npm --prefix server run dev",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm --prefix web run build",
+    "start": "npm --prefix server start",
+    "start:mock": "NETMON_MOCK=1 npm --prefix server start",
+    "install:all": "npm install && npm --prefix server install && npm --prefix web install",
+    "test:e2e": "npm run build && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "concurrently": "^9.1.0"
+  }
+}

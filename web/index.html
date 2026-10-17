@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" data-theme="dark" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="NetMon — local network and internet monitor" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" id="favicon" />
+    <title>NetMon</title>
+    <script>
+      // Pre-paint theme resolution (no flash). Mirrors src/composables/useTheme.js.
+      // Preference lives in localStorage 'netmon.ui' (JSON, field "theme"): 'system' | 'dark' | 'light'.
+      (function () {
+        var pref = 'system';
+        try {
+          var raw = localStorage.getItem('netmon.ui');
+          if (raw) {
+            var t = JSON.parse(raw).theme;
+            if (t === 'dark' || t === 'light' || t === 'system') pref = t;
+          }
+        } catch (e) {}
+        var resolved = pref;
+        if (pref === 'system') {
+          try {
+            resolved = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+          } catch (e) { resolved = 'dark'; }
+        }
+        var root = document.documentElement;
+        root.setAttribute('data-theme', resolved);
+        root.classList.toggle('dark', resolved === 'dark');
+        root.style.colorScheme = resolved;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>NetMon needs JavaScript enabled.</noscript>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
