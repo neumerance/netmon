@@ -1,0 +1,4 @@
+# Downloaded at build time by .github/workflows/windows.yml (WinSW, third-party licences) - never committed
+build/
+# iscc output (NetMon-Setup-<version>.exe)
+Output/

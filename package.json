@@ -14,10 +14,13 @@
     "start": "npm --prefix server start",
     "start:mock": "NETMON_MOCK=1 npm --prefix server start",
     "install:all": "npm install && npm --prefix server install && npm --prefix web install",
-    "test:e2e": "npm run build && playwright test"
+    "test:e2e": "npm run build && playwright test",
+    "build:exe": "node scripts/build-exe.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.50.0",
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
   }
 }

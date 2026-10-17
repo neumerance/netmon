@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW v2.12.0 service definition for NetMon (https://github.com/winsw/winsw, MIT).
+  WinSW-x64.exe is shipped as NetMonService.exe next to NetMon.exe; WinSW reads the XML file that has the same
+  base name (NetMonService.xml).
+
+  This file is a TEMPLATE. The installer (installer/netmon.iss) replaces the placeholders (a name between two
+  at-signs) with the options chosen in the wizard and writes the result to {app}\NetMonService.xml. Re-run the
+  installer to change them; hand edits are overwritten on the next install or upgrade.
+
+    HOST       127.0.0.1 (this PC only) or 0.0.0.0 (other devices on the LAN)
+    PORT       HTTP port (1024-65535, default 4000)
+    DATA_DIR   %ProgramData%\NetMon
+    LOG_DIR    %ProgramData%\NetMon\logs
+    LAN_ENV    empty for "this PC only". With LAN access: an env element NETMON_ALLOW_LAN=1 (NetMon refuses a
+               non-loopback HOST without it) plus, when "Require an access token" is ticked, NETMON_TOKEN.
+
+  The service runs as LocalSystem (the WinSW default).
+-->
+<service>
+  <id>NetMon</id>
+  <name>NetMon Network Monitor</name>
+  <description>NetMon: discovers the devices on your local network, watches the internet connection and serves the NetMon dashboard.</description>
+
+  <executable>%BASE%\NetMon.exe</executable>
+  <workingdirectory>@DATA_DIR@</workingdirectory>
+
+  <env name="HOST" value="@HOST@"/>
+  <env name="PORT" value="@PORT@"/>
+  <env name="NETMON_DATA_DIR" value="@DATA_DIR@"/>
+  <!--@LAN_ENV@-->
+
+  <!-- Start automatically after boot, once the network stack and other automatic services are up. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Crash recovery: restart after 5 s (three times), then every 60 s. The counter resets after an hour. -->
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- On stop WinSW sends Ctrl+C to the console app (NetMon flushes its data and exits); it only kills the
+       process tree if NetMon is still running after 15 s. -->
+  <stoptimeout>15 sec</stoptimeout>
+
+  <!-- NetMonService.out.log / .err.log (NetMon's console output) and NetMonService.wrapper.log (WinSW itself).
+       The output logs roll at 10 MB, keeping 8 old files each. -->
+
+  <logpath>@LOG_DIR@</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>

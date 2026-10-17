@@ -10,14 +10,20 @@ import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import {
-  normalizeMac, isMulticastOrBroadcastMac, isZeroMac, isValidIpv4, ipInCidr, hostsToScan, compareIp,
+  normalizeMac, isMulticastOrBroadcastMac, isZeroMac, isValidIpv4, ipInCidr, hostsToScan, compareIp, winSystemBinary,
 } from './sys.js';
 import { ping, pool } from './pinger.js';
 import { lookupVendor } from './oui.js';
 
 const run = promisify(execFile);
-const EXEC_OPTS = { timeout: 5000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C', LANG: 'C' } };
+// windowsHide is ignored on POSIX; on Windows it stops console windows flashing.
+const EXEC_OPTS = { timeout: 5000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, windowsHide: true };
 const IS_LINUX = process.platform === 'linux';
+const IS_WIN = process.platform === 'win32';
+
+// Every Windows ping is a ping.exe process (~20–50 ms CreateProcess cost each); 64 in flight makes the
+// box stutter, 32 keeps a /24 sweep at roughly 8 waves of <= 1.7 s.
+export const WIN_MAX_SWEEP_CONCURRENCY = 32;
 
 const DNS_TIMEOUT_MS = 1500;
 const DNS_CACHE_MS = 10 * 60 * 1000;
@@ -89,8 +95,66 @@ function makeEntry(ip, macRaw, iface, permanent) {
   return { ip, mac, iface: iface || null, permanent: Boolean(permanent) };
 }
 
-/** Read the neighbour table with the best tool available on this platform. */
-export async function readNeighbours() {
+// Windows `arp -a` (any display language; only the layout is relied on):
+//   'Interface: 192.168.0.101 --- 0xb'                 (de: 'Schnittstelle: ...', fr: 'Interface : ...')
+//   '  Internet Address      Physical Address      Type'
+//   '  192.168.0.1           20-23-51-ea-0f-f0     dynamic'   (de: 'dynamisch', fr: 'dynamique')
+//   '  192.168.0.255         ff-ff-ff-ff-ff-ff     static'
+const WIN_ARP_IFACE_RE = /(\d{1,3}(?:\.\d{1,3}){3})\s+-{3}\s+0x[0-9a-f]+/i;
+const WIN_ARP_ROW_RE = /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-f]{2}(?:-[0-9a-f]{2}){5})(?:\s+(\S+))?/i;
+const WIN_STATIC_RE = /^(stat|est[aá]t|静的|静态|靜態)/i;
+
+/**
+ * Parse Windows `arp -a` / `arp -a -N <ifaceIp>`. Broadcast, multicast (01-00-5e, 33-33), all-zero
+ * (incomplete / invalid) and >= 224.x entries are dropped by makeEntry.
+ * @param {string} text
+ * @param {{ifaceIp?: string|null}} [opts] keep only the section whose 'Interface: <ip>' header matches
+ * @returns {Array<{ip, mac, iface, permanent}>} iface = the section's interface IP (map it to a name yourself)
+ */
+export function parseWinArp(text, { ifaceIp = null } = {}) {
+  const out = [];
+  let section = null;
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const h = WIN_ARP_IFACE_RE.exec(raw);
+    if (h) { section = h[1]; continue; }
+    const m = WIN_ARP_ROW_RE.exec(raw);
+    if (!m) continue;
+    if (ifaceIp && section !== ifaceIp) continue;
+    const entry = makeEntry(m[1], m[2], section, WIN_STATIC_RE.test(m[3] || ''));
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+// arp.exe exits 1 with 'No ARP Entries Found.' for an empty table: that is an empty result, not an error.
+async function runWinArp(args) {
+  try {
+    return (await run(winSystemBinary('ARP.EXE'), args, EXEC_OPTS)).stdout;
+  } catch (err) {
+    if (typeof err?.code === 'number' && typeof err.stdout === 'string' && !err.killed) return err.stdout;
+    throw err;
+  }
+}
+
+async function readWinNeighbours(network) {
+  const ifaceIp = network && isValidIpv4(network.ip) ? network.ip : null;
+  let text = null;
+  if (ifaceIp) {
+    // -N restricts the dump to our interface.
+    try { text = await runWinArp(['-a', '-N', ifaceIp]); } catch { text = null; }
+  }
+  if (text == null || !parseWinArp(text, { ifaceIp }).length) text = await runWinArp(['-a']);
+  // Rows of our interface get the interface name so the shared iface filter in scan() applies;
+  // other sections keep their IP and are dropped by it.
+  return parseWinArp(text, { ifaceIp }).map((e) => ({ ...e, iface: e.iface === ifaceIp && network?.iface ? network.iface : e.iface }));
+}
+
+/**
+ * Read the neighbour table with the best tool available on this platform.
+ * @param {object} [network] NetworkInfo; used on Windows to pick the interface section of `arp -a`
+ */
+export async function readNeighbours(network = null) {
+  if (IS_WIN) return readWinNeighbours(network);
   if (IS_LINUX) {
     try {
       const { stdout } = await run('ip', ['-4', 'neigh', 'show'], EXEC_OPTS);
@@ -165,6 +229,7 @@ export function createDiscovery({ network, intervalMs = 30000, concurrency = 64,
   let running = false;
   let inFlight = null;
   let warnedArp = false;
+  const sweepConcurrency = IS_WIN ? Math.min(concurrency, WIN_MAX_SWEEP_CONCURRENCY) : concurrency;
 
   const selfHostname = cleanHostname(os.hostname());
 
@@ -208,14 +273,14 @@ export function createDiscovery({ network, intervalMs = 30000, concurrency = 64,
       targets.push(network.gateway);
     }
     const results = new Map(); // ip -> PingResult
-    await pool(targets, concurrency, async (ip) => {
+    await pool(targets, sweepConcurrency, async (ip) => {
       results.set(ip, await ping(ip, { timeoutMs: pingTimeoutMs }));
     });
 
     // 2) Neighbour table, restricted to our interface and subnet.
     let neigh = [];
     try {
-      neigh = await readNeighbours();
+      neigh = await readNeighbours(network);
       warnedArp = false;
     } catch (err) {
       if (!warnedArp) console.warn(`[discovery] reading the ARP table failed: ${err?.message || err}`);

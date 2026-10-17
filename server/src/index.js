@@ -2,14 +2,15 @@
 // into core state, exposes the REST + SSE API and serves the built web app.
 //
 // Env: PORT (default 4000), HOST (default 127.0.0.1), NETMON_MOCK=1 (mock mode),
-//      NETMON_DATA_DIR (default server/data),
+//      NETMON_DATA_DIR (default server/data; packaged exe: %ProgramData%\NetMon on Windows, ~/.netmon elsewhere),
+//      NETMON_CONFIG (optional netmon.json; the packaged exe also reads <exe dir>/netmon.json and
+//      <data dir>/netmon.json, see core/paths.js; env vars always win),
 //      NETMON_ALLOW_LAN=1 (required to bind a non-loopback HOST without a token),
 //      NETMON_TOKEN (shared secret required on every /api request; recommended with a LAN HOST),
 //      NETMON_ALLOWED_HOSTS (comma-separated extra Host names, e.g. a reverse-proxy name).
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import express from 'express';
 
 import { REAL_TIMINGS } from './core/timings.js';
@@ -22,20 +23,48 @@ import { createSseHub } from './core/sse.js';
 import { createApiRouter } from './routes/api.js';
 import { createApiGuard, isLoopbackHost } from './core/guard.js';
 import { createTopologyStore, MOCK_DEFAULT_OVERRIDES } from './core/topology.js';
+import { resolveRuntime } from './core/paths.js';
+import { createEmbeddedStatic } from './core/embeddedStatic.js';
 
 const VERSION = '1.0.0';
-const MOCK = process.env.NETMON_MOCK === '1';
-const PORT = Number.parseInt(process.env.PORT, 10) || 4000;
-const HOST = process.env.HOST || '127.0.0.1';
-const TOKEN = process.env.NETMON_TOKEN ? String(process.env.NETMON_TOKEN) : null;
-const ALLOW_LAN = process.env.NETMON_ALLOW_LAN === '1';
-const EXTRA_HOSTS = String(process.env.NETMON_ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
+process.title = 'NetMon';
+
+const cliArgs = process.argv.slice(2); // a packaged exe has argv[1] = execPath too, so this works for both
+if (cliArgs.includes('--version') || cliArgs.includes('-v')) {
+  console.log(VERSION);
+  process.exit(0);
+}
+if (cliArgs.includes('--help') || cliArgs.includes('-h')) {
+  console.log(`NetMon ${VERSION} - local network and internet monitoring dashboard
+
+Usage: netmon [--version] [--help]
+
+Configuration: environment variables. The packaged executable also reads an optional netmon.json
+({"port", "host", "token", "allowLan", "allowedHosts", "dataDir"}) next to the executable and in the data
+directory; environment variables always win.
+  PORT                  HTTP port (default 4000)
+  HOST                  bind address (default 127.0.0.1; 0.0.0.0 needs NETMON_TOKEN or NETMON_ALLOW_LAN=1)
+  NETMON_TOKEN          shared secret required on every /api request
+  NETMON_ALLOW_LAN=1    allow a non-loopback HOST without a token
+  NETMON_ALLOWED_HOSTS  comma-separated extra Host header names
+  NETMON_DATA_DIR       data directory
+  NETMON_CONFIG         explicit path of a netmon.json config file
+  NETMON_MOCK=1         mock mode (simulated network)`);
+  process.exit(0);
+}
+
+const RUNTIME = resolveRuntime();
+const ENV = RUNTIME.env; // process.env plus netmon.json defaults (env vars win)
+const MOCK = ENV.NETMON_MOCK === '1';
+const PORT = Number.parseInt(ENV.PORT, 10) || 4000;
+const HOST = ENV.HOST || '127.0.0.1';
+const TOKEN = ENV.NETMON_TOKEN ? String(ENV.NETMON_TOKEN) : null;
+const ALLOW_LAN = ENV.NETMON_ALLOW_LAN === '1';
+const EXTRA_HOSTS = String(ENV.NETMON_ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
 const LOOPBACK_BIND = isLoopbackHost(HOST);
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const SERVER_ROOT = path.resolve(here, '..');
-const DATA_DIR = path.resolve(process.env.NETMON_DATA_DIR || path.join(SERVER_ROOT, 'data'));
-const WEB_DIST = path.resolve(SERVER_ROOT, '..', 'web', 'dist');
+const DATA_DIR = RUNTIME.dataDir;
+const WEB_DIST = RUNTIME.webDist; // null when packaged: the web app is embedded in the executable
 
 // A bug in one module must never take the whole monitor down.
 process.on('unhandledRejection', (reason) => {
@@ -114,6 +143,21 @@ async function main() {
   if (!LOOPBACK_BIND) {
     console.warn(`[netmon] WARNING: listening on ${HOST}: the NetMon API is reachable from other machines`
       + (TOKEN ? ' (token required).' : ' WITHOUT authentication (NETMON_ALLOW_LAN=1).'));
+  }
+
+  if (RUNTIME.packaged) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      console.error(`[netmon] cannot create data directory ${DATA_DIR}: ${err?.message || err}`
+        + '\n  Set NETMON_DATA_DIR to a writable directory.');
+      process.exit(1);
+    }
+    console.log(`[netmon] data directory: ${DATA_DIR}`
+      + (RUNTIME.configFiles.length ? `; config: ${RUNTIME.configFiles.join(', ')}` : ''));
+    if (!RUNTIME.seaAssets) console.warn('[netmon] this executable has no embedded web app; only the API is served');
+  } else if (RUNTIME.configFiles.length) {
+    console.log(`[netmon] config: ${RUNTIME.configFiles.join(', ')}`);
   }
 
   const impl = await loadImpl();
@@ -330,14 +374,21 @@ async function main() {
     },
   }));
 
-  // Static web app with SPA fallback (checked per request so a later `npm run build` needs no restart).
-  const staticMw = express.static(WEB_DIST, { index: 'index.html', maxAge: '1h', setHeaders: (res, file) => {
-    if (file.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
-  } });
-  app.use((req, res, next) => (fs.existsSync(WEB_DIST) ? staticMw(req, res, next) : next()));
+  // Static web app with SPA fallback. Packaged exe: served from the assets embedded in the executable.
+  // From source: web/dist on disk, checked per request so a later `npm run build` needs no restart.
+  const embedded = RUNTIME.seaAssets ? createEmbeddedStatic(RUNTIME.seaAssets) : null;
+  if (embedded) {
+    app.use(embedded.middleware);
+  } else if (WEB_DIST) {
+    const staticMw = express.static(WEB_DIST, { index: 'index.html', maxAge: '1h', setHeaders: (res, file) => {
+      if (file.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
+    } });
+    app.use((req, res, next) => (fs.existsSync(WEB_DIST) ? staticMw(req, res, next) : next()));
+  }
   app.get('*', (req, res) => {
-    const index = path.join(WEB_DIST, 'index.html');
-    if (fs.existsSync(index)) {
+    if (embedded?.hasIndex) return embedded.sendIndex(req, res);
+    const index = WEB_DIST ? path.join(WEB_DIST, 'index.html') : null;
+    if (index && fs.existsSync(index)) {
       res.setHeader('Cache-Control', 'no-cache');
       return res.sendFile(index);
     }
@@ -407,6 +458,8 @@ async function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // Windows: service wrappers / consoles may stop us with Ctrl+Break instead of Ctrl+C.
+  if (process.platform === 'win32') process.on('SIGBREAK', () => shutdown('SIGBREAK'));
 }
 
 main().catch((err) => {

@@ -1,0 +1,9 @@
+
+Schnittstelle: 192.168.178.20 --- 0x7
+  Internetadresse       Physische Adresse     Typ
+  192.168.178.1         38-10-d5-aa-bb-cc     dynamisch
+  192.168.178.34        f0-18-98-01-02-03     dynamisch
+  192.168.178.255       ff-ff-ff-ff-ff-ff     statisch
+  224.0.0.22            01-00-5e-00-00-16     statisch
+  224.0.0.251           01-00-5e-00-00-fb     statisch
+  255.255.255.255       ff-ff-ff-ff-ff-ff     statisch

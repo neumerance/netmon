@@ -6,13 +6,24 @@
 //           interval so a dead host costs ~0.1 s + W instead of ~1 s + W (allowed unprivileged).
 //   Linux:  -W <s> is the reply timeout (whole seconds on older iputils), -t would set the TTL.
 //   BusyBox: no -n / -i support -> automatic fallback to the minimal argument set.
+//   Windows: %SystemRoot%\System32\PING.EXE -n 1 -w <ms> IP (-n = count, -w = reply wait in ms). See
+//            parseWinPingOutput for the locale-independent reply parsing.
 
 import { execFile } from 'node:child_process';
 import net from 'node:net';
-import { isValidIpv4 } from './sys.js';
+import { isValidIpv4, winSystemBinary } from './sys.js';
 
 const IS_MAC = process.platform === 'darwin' || process.platform === 'freebsd';
+const IS_WIN = process.platform === 'win32';
 const ENV = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+
+// Windows `ping -n 1 -w <ms>` ends on its own after ~w ms; the extra kill margin only matters for
+// dead hosts on the local subnet, where ARP resolution can keep ping.exe alive for ~3 s.
+const WIN_KILL_MARGIN_MS = 1000;
+
+// Windows RTT reported as 'time<1ms': the true value is in [0, 1) ms; the midpoint 0.5 ms is used so it
+// never reads as an exact 1 ms measurement. (The Unix parser is unchanged: 'time<1 ms' -> 1.)
+export const WIN_SUB_MS_RTT = 0.5;
 
 // Reply line, e.g. 'macOS: 64 bytes from 10.0.0.1: icmp_seq=0 ttl=63 time=3.205 ms'
 //                  'Linux: 64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=12.3 ms' / 'time<1 ms'
@@ -26,10 +37,17 @@ const USAGE_RE = /usage|invalid option|illegal option|unrecognized option|bad (?
 let argStyle = 'full'; // 'full' | 'minimal'
 let warnedPermission = false;
 
-function buildArgs(ip, timeoutMs, style) {
+/** argv for one echo. Exported for tests; `platform` defaults to the running OS. */
+export function buildPingArgs(ip, timeoutMs, style = 'full', platform = process.platform) {
+  const ms = Math.max(100, Math.round(timeoutMs));
+  if (platform === 'win32') return ['-n', '1', '-w', String(ms), ip];
+  return buildArgs(ip, timeoutMs, style, platform === 'darwin' || platform === 'freebsd');
+}
+
+function buildArgs(ip, timeoutMs, style, isMac = IS_MAC) {
   const ms = Math.max(100, Math.round(timeoutMs));
   const secs = Math.max(1, Math.ceil(ms / 1000));
-  if (IS_MAC) {
+  if (isMac) {
     return style === 'full'
       ? ['-c', '1', '-n', '-i', '0.1', '-W', String(ms), '-t', String(secs + 1), ip]
       : ['-c', '1', '-n', '-W', String(ms), '-t', String(secs + 1), ip];
@@ -44,6 +62,47 @@ function execPing(args, timeoutMs) {
     execFile('ping', args, { timeout: timeoutMs + 2000, env: ENV, maxBuffer: 64 * 1024, windowsHide: true },
       (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') }));
   });
+}
+
+function execWinPing(args, timeoutMs) {
+  return new Promise((resolve) => {
+    execFile(winSystemBinary('PING.EXE'), args, { timeout: timeoutMs + WIN_KILL_MARGIN_MS, maxBuffer: 64 * 1024, windowsHide: true },
+      (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') }));
+  });
+}
+
+// Windows reply line, by locale:
+//   en: 'Reply from 192.168.0.1: bytes=32 time=12ms TTL=64'      / 'time<1ms'
+//   de: 'Antwort von 192.168.0.1: Bytes=32 Zeit<1ms TTL=64'
+//   fr: 'Réponse de 192.168.0.1 : octets=32 temps=3 ms TTL=64'
+//   ja: '192.168.0.1 からの応答: バイト数 =32 時間 <1ms TTL=64'
+//   ru: 'Ответ от 192.168.0.1: число байт=32 время=2мс TTL=128'   (OEM code page: unit arrives garbled)
+// Only the numeric shape is relied on: a line with 'TTL=<n>' whose value just before it is '[=<]<n><unit>'.
+// Unreachable / timeout / TTL-expired lines ('Reply from 192.168.0.1: Destination host unreachable.',
+// 'Zielhost nicht erreichbar', 'TTL expired in transit') carry no 'TTL=<n>', so they are NOT replies,
+// even though ping.exe exits 0 for them.
+const WIN_TTL_RE = /\bTTL\s*=\s*(\d+)/i;
+// A unit token ('ms', 'мс', garbled bytes) is required so 'bytes=32 TTL=64' never reads as a 32 ms RTT.
+const WIN_TIME_TTL_RE = /([=<])\s*(\d+(?:[.,]\d+)?)\s*[^\s\d=<]+\s+TTL\s*=\s*\d+/i;
+const IPV4_IN_LINE_RE = /(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])/;
+
+/** Parse one Windows ping.exe invocation (any display language). Exported for unit tests. */
+export function parseWinPingOutput(stdout, ip = null) {
+  const dead = { alive: false, rttMs: null, ttl: null };
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    const ttl = WIN_TTL_RE.exec(line);
+    if (!ttl) continue;
+    const from = IPV4_IN_LINE_RE.exec(line)?.[1] ?? null;
+    if (ip && from !== ip) continue; // reply from another host (redirect / proxy) -> not this target
+    const t = WIN_TIME_TTL_RE.exec(line);
+    let rtt = null;
+    if (t) {
+      rtt = t[1] === '<' ? WIN_SUB_MS_RTT : Number(t[2].replace(',', '.'));
+      if (!Number.isFinite(rtt)) rtt = null;
+    }
+    return { alive: true, rttMs: rtt != null ? Math.round(rtt * 100) / 100 : null, ttl: Number(ttl[1]) };
+  }
+  return dead;
 }
 
 /** Parse one ping invocation's stdout. Exported for unit tests. */
@@ -69,6 +128,12 @@ export function parsePingOutput(stdout, ip = null) {
 export async function ping(ip, { timeoutMs = 1000 } = {}) {
   if (!isValidIpv4(ip)) return { alive: false, rttMs: null, ttl: null };
   const t = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 1000;
+
+  if (IS_WIN) {
+    // Exit codes are meaningless here (0 for 'Destination host unreachable'); only the parsed line counts.
+    const res = await execWinPing(buildPingArgs(ip, t, 'full', 'win32'), t);
+    return parseWinPingOutput(res.stdout, ip);
+  }
 
   let res = await execPing(buildArgs(ip, t, argStyle), t);
   if (res.err && argStyle === 'full' && USAGE_RE.test(res.stderr)) {

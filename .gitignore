@@ -3,6 +3,9 @@ node_modules/
 
 # Build output
 web/dist/
+# Single-executable build (scripts/build-exe.mjs): intermediates + output
+build/
+dist-exe/
 
 # Runtime data (saved devices, history, events)
 server/data/

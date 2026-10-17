@@ -1,0 +1,7 @@
+
+Ping wird ausgeführt für 192.168.0.77 mit 32 Bytes Daten:
+Antwort von 192.168.0.101: Zielhost nicht erreichbar.
+
+Ping-Statistik für 192.168.0.77:
+    Pakete: Gesendet = 1, Empfangen = 1, Verloren = 0
+    (0% Verlust),

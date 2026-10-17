@@ -1,0 +1,337 @@
+# Windows build + release pipeline for NetMon.
+#
+#   unit-unix ─────────────────────────────┐ (independent)
+#   test-windows ──► package ──► release   │ release only for tags v*
+#
+# - test-windows: server unit tests (incl. the Windows parsers) + Playwright e2e (mock mode) on real Windows.
+# - package: NetMon.exe (Node SEA), exe smoke test, WinSW download + SHA-256 check, Inno Setup installer, then an
+#   install / upgrade / uninstall test of that installer on the runner (real Windows service, firewall, ACLs).
+# - release: on tags v*, a GitHub Release with NetMon-Setup-<version>.exe and its .sha256 file.
+#
+# Third-party actions are pinned to full commit SHAs (tag in the comment), all released > 2 weeks before use.
+
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '22'
+  # WinSW v2.12.0 (MIT), shipped in the installer as NetMonService.exe. The release publishes no checksum, so this
+  # is the SHA-256 of https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe (18,243,033 bytes)
+  # computed when it was pinned; the package job fails if the download ever differs.
+  WINSW_VERSION: 'v2.12.0'
+  WINSW_SHA256: '05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da'
+
+jobs:
+  unit-unix:
+    name: Server unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm --prefix server ci
+      - run: npm --prefix server test
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            web/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix server ci
+          npm --prefix web ci
+      - name: Server unit tests
+        run: npm --prefix server test
+      - name: Build web app
+        run: npm run build
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Playwright e2e (mock mode)
+        run: npx playwright test --reporter=line,html
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report-windows
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+  package:
+    name: Package (NetMon.exe + installer)
+    needs: test-windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+            web/package-lock.json
+
+      - name: Version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -match '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') {
+              $version = $Matches[1]
+            } else {
+              throw "Release tags must look like v1.2.3 or v1.2.3-beta.1, got '$env:REF_NAME'"
+            }
+          } else {
+            $version = "0.0.0-$($env:SHA.Substring(0, 7))"
+          }
+          "Version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "NETMON_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix server ci
+          npm --prefix web ci
+
+      - name: Build NetMon.exe
+        run: npm run build:exe
+
+      - name: Smoke test NetMon.exe (mock mode)
+        run: |
+          $exe = (Resolve-Path dist-exe\NetMon.exe).Path
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "NetMon.exe --version exited with $LASTEXITCODE" }
+
+          $data = Join-Path $env:RUNNER_TEMP 'nm'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          $env:NETMON_MOCK = '1'
+          $env:PORT = '4555'
+          $env:HOST = '127.0.0.1'
+          $env:NETMON_DATA_DIR = $data
+          $out = Join-Path $env:RUNNER_TEMP 'netmon-smoke.out.log'
+          $err = Join-Path $env:RUNNER_TEMP 'netmon-smoke.err.log'
+          $proc = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+          try {
+            $healthy = $false
+            for ($i = 0; $i -lt 60 -and -not $healthy; $i++) {
+              Start-Sleep -Milliseconds 500
+              if ($proc.HasExited) { throw "NetMon.exe exited early with code $($proc.ExitCode)" }
+              try { $healthy = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://127.0.0.1:4555/api/health).StatusCode -eq 200 } catch {}
+            }
+            if (-not $healthy) { throw 'NetMon.exe did not answer /api/health within 30 s' }
+            (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4555/api/health).Content
+            $page = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4555/).Content
+            if ($page -notmatch 'NetMon') { throw 'GET / does not contain "NetMon"' }
+            'Smoke test passed'
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            '--- stdout ---'; Get-Content $out -ErrorAction SilentlyContinue
+            '--- stderr ---'; Get-Content $err -ErrorAction SilentlyContinue
+          }
+
+      - name: Download WinSW and licences
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force installer\build\licenses | Out-Null
+          $winsw = 'installer\build\WinSW-x64.exe'
+          Invoke-WebRequest -UseBasicParsing -OutFile $winsw `
+            "https://github.com/winsw/winsw/releases/download/$env:WINSW_VERSION/WinSW-x64.exe"
+          $actual = (Get-FileHash -Algorithm SHA256 $winsw).Hash.ToLowerInvariant()
+          "WinSW-x64.exe $env:WINSW_VERSION SHA-256: $actual"
+          if ($actual -ne $env:WINSW_SHA256) { throw "WinSW checksum mismatch: expected $env:WINSW_SHA256" }
+
+          Invoke-WebRequest -UseBasicParsing -OutFile installer\build\licenses\WinSW-LICENSE.txt `
+            "https://raw.githubusercontent.com/winsw/winsw/$env:WINSW_VERSION/LICENSE.txt"
+          # NetMon.exe embeds the Node.js runtime that built it.
+          $nodeVersion = node -p "process.version"
+          Invoke-WebRequest -UseBasicParsing -OutFile installer\build\licenses\Node.js-LICENSE.txt `
+            "https://raw.githubusercontent.com/nodejs/node/$nodeVersion/LICENSE"
+
+      - name: Set up Inno Setup
+        run: |
+          function Find-Iscc {
+            @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          $iscc = Find-Iscc
+          # x64compatible needs Inno Setup 6.3+.
+          if (-not $iscc -or [version](Get-Item $iscc).VersionInfo.ProductVersion -lt [version]'6.3') {
+            choco upgrade innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco failed with $LASTEXITCODE" }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw 'ISCC.exe not found' }
+          "Using $iscc ($((Get-Item $iscc).VersionInfo.ProductVersion))"
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build installer
+        run: |
+          & $env:ISCC "/DAppVersion=$env:NETMON_VERSION" installer\netmon.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          $setup = "installer\Output\NetMon-Setup-$env:NETMON_VERSION.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$setup.sha256", "$hash  NetMon-Setup-$env:NETMON_VERSION.exe`n")
+          Get-Item $setup, "$setup.sha256" | Format-Table Name, Length
+          "SHA-256: $hash"
+
+      - name: Test installer (install, upgrade, uninstall)
+        run: |
+          $setup = (Resolve-Path "installer\Output\NetMon-Setup-$env:NETMON_VERSION.exe").Path
+          $app = Join-Path $env:ProgramFiles 'NetMon'
+          $data = Join-Path $env:ProgramData 'NetMon'
+          $rules = 'NetMon - Web dashboard (TCP-In)', 'NetMon - mDNS (UDP-In)', 'NetMon - SSDP announcements (UDP-In)',
+                   'NetMon - SSDP replies (UDP-In)', 'NetMon - NetBIOS replies (UDP-In)'
+
+          function Run-Setup([string]$exe, [string[]]$arguments) {
+            $p = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "$exe exited with $($p.ExitCode)" }
+          }
+          function Test-Rule([string]$name) {
+            netsh advfirewall firewall show rule name="$name" | Out-Null
+            return $LASTEXITCODE -eq 0
+          }
+          function Get-Health([int]$port, [string]$token) {
+            $headers = @{}
+            if ($token) { $headers['X-NetMon-Token'] = $token }
+            try { return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Headers $headers "http://127.0.0.1:$port/api/health").StatusCode }
+            catch { if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode } else { return 0 } }
+          }
+          function Wait-Health([int]$port, [string]$token) {
+            for ($i = 0; $i -lt 60; $i++) { if ((Get-Health $port $token) -eq 200) { return }; Start-Sleep -Milliseconds 500 }
+            throw "NetMon did not answer on port $port"
+          }
+          function Assert($condition, [string]$message) { if (-not $condition) { throw "FAILED: $message" }; "ok: $message" }
+
+          try {
+            '== 1. Fresh install: LAN access + token, port 4601'
+            Run-Setup $setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LAN=1', '/TOKEN=1', '/PORT=4601', "/LOG=$env:RUNNER_TEMP\setup-1.log")
+            Assert ((Get-Service NetMon).Status -eq 'Running') 'service running'
+            Assert ((Get-CimInstance Win32_Service -Filter "Name='NetMon'").StartMode -eq 'Auto') 'service starts automatically'
+            [xml]$xml = Get-Content (Join-Path $app 'NetMonService.xml')
+            $envs = @{}; $xml.service.env | ForEach-Object { $envs[$_.name] = $_.value }
+            Assert ($envs['HOST'] -eq '0.0.0.0' -and $envs['NETMON_ALLOW_LAN'] -eq '1' -and $envs['PORT'] -eq '4601') 'LAN env vars'
+            $token = $envs['NETMON_TOKEN']
+            Assert ($token.Length -ge 20) 'token generated'
+            Wait-Health 4601 $token
+            Assert ((Get-Health 4601 $null) -eq 401) 'API refuses requests without the token'
+            foreach ($r in $rules) { Assert (Test-Rule $r) "firewall rule '$r'" }
+            Assert ((Get-Acl $data).AreAccessRulesProtected) 'data folder ACL does not inherit'
+            $usersWrite = (Get-Acl $data).Access | Where-Object {
+              $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-545' -and
+              ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::WriteData) }
+            Assert (-not $usersWrite) 'Users cannot write to the data folder'
+            Assert (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\NetMon\Open NetMon.url") 'Start Menu shortcut'
+
+            '== 2. Upgrade / re-run: this PC only, port 4602'
+            Run-Setup $setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LAN=0', '/PORT=4602', "/LOG=$env:RUNNER_TEMP\setup-2.log")
+            Assert ((Get-Service NetMon).Status -eq 'Running') 'service running after upgrade'
+            Wait-Health 4602 $null
+            [xml]$xml = Get-Content (Join-Path $app 'NetMonService.xml')
+            $envs = @{}; $xml.service.env | ForEach-Object { $envs[$_.name] = $_.value }
+            Assert ($envs['HOST'] -eq '127.0.0.1' -and -not $envs.ContainsKey('NETMON_ALLOW_LAN') -and -not $envs.ContainsKey('NETMON_TOKEN')) 'loopback env vars'
+            Assert (-not (Test-Rule $rules[0])) 'no inbound dashboard rule without LAN access'
+            Assert (Test-Rule $rules[1]) 'discovery rules kept'
+
+            '== 3. Uninstall (silent: data is kept)'
+            Run-Setup (Join-Path $app 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$env:RUNNER_TEMP\uninstall.log")
+            # The uninstaller re-launches itself from %TEMP%; wait for it to finish.
+            for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $app 'NetMon.exe')); $i++) { Start-Sleep -Milliseconds 500 }
+            for ($i = 0; $i -lt 20; $i++) { sc.exe query NetMon | Out-Null; if ($LASTEXITCODE -eq 1060) { break }; Start-Sleep -Milliseconds 500 }
+            Assert ($LASTEXITCODE -eq 1060) 'service removed'
+            Assert (-not (Test-Path (Join-Path $app 'NetMon.exe'))) 'program files removed'
+            foreach ($r in $rules) { Assert (-not (Test-Rule $r)) "firewall rule '$r' removed" }
+            Assert (Test-Path $data) 'data folder kept'
+          } catch {
+            Get-ChildItem $env:RUNNER_TEMP -Filter '*.log' | ForEach-Object { "--- $($_.Name) ---"; Get-Content $_.FullName -Tail 80 }
+            Get-ChildItem (Join-Path $data 'logs') -ErrorAction SilentlyContinue | ForEach-Object { "--- $($_.Name) ---"; Get-Content $_.FullName -Tail 80 }
+            throw
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NetMon-Setup-${{ steps.version.outputs.version }}
+          path: |
+            installer/Output/NetMon-Setup-${{ steps.version.outputs.version }}.exe
+            installer/Output/NetMon-Setup-${{ steps.version.outputs.version }}.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub Release
+    needs: package
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: NetMon-Setup-${{ needs.package.outputs.version }}
+          path: dist
+      - name: Verify checksum
+        working-directory: dist
+        run: sha256sum -c ./*.sha256
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: NetMon ${{ needs.package.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.package.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/NetMon-Setup-${{ needs.package.outputs.version }}.exe
+            dist/NetMon-Setup-${{ needs.package.outputs.version }}.exe.sha256

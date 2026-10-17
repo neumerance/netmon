@@ -3,17 +3,61 @@
 // `getNetworkInfo` is pure and safe to import in mock mode.
 
 import os from 'node:os';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
-const EXEC_OPTS = { timeout: 3000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C', LANG: 'C' } };
+// windowsHide is ignored on POSIX; on Windows it stops console windows flashing (service / tray use).
+const EXEC_OPTS = { timeout: 3000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, windowsHide: true };
 
 // Interfaces that are never the LAN we want to scan (VPN tunnels, Apple AWDL/low-latency WLAN,
 // bridges, container and VM networks, overlay VPNs, loopback).
 const EXCLUDED_IFACE_RE =
   /^(utun|awdl|llw|bridge|docker|veth|lo|br-|virbr|vmnet|vboxnet|tun|tap|wg|zt|tailscale|anpi|ap\d|gif|stf|ipsec|ppp|ham|nordlynx|cni|flannel|cali|kube)/i;
+
+// Windows adapter names (os.networkInterfaces() keys are adapter "friendly names": 'Ethernet', 'Wi-Fi',
+// 'WLAN', 'Ethernet 2', ...). Excluded: loopback, Hyper-V/WSL/Docker internal switches, VM host-only
+// adapters, Bluetooth PAN, IPv6 transition tunnels, Wi-Fi Direct virtual adapters ('Local Area Connection* N')
+// and common VPN clients. An external Hyper-V switch ('vEthernet (External)') is NOT excluded: on such
+// hosts it is the adapter that carries the LAN address.
+const EXCLUDED_WIN_IFACE_RE =
+  /^(Loopback Pseudo-Interface|vEthernet \((WSL|Default Switch|DockerNAT|nat\b)|VirtualBox|VMware|Bluetooth|Teredo|isatap|6TO4|Npcap|Hyper-V|ZeroTier|Tailscale|OpenVPN|TAP-|WireGuard|NordLynx|ProtonVPN|Mullvad|Cloudflare WARP|Local Area Connection\*|LAN-Verbindung\*|Conexi\S+n de \S+rea local\*|Connexion au r\S+seau local\*)/i;
+
+// ------------------------------------------------------------------------------------------------
+// Windows process helpers. Absolute System32 paths, so a service running as LocalSystem never runs a
+// planted ping.exe / arp.exe found earlier on PATH.
+// ------------------------------------------------------------------------------------------------
+
+/** 'PING.EXE' -> 'C:\Windows\System32\PING.EXE' (from %SystemRoot%). */
+export function winSystemBinary(name) {
+  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+  return path.win32.join(root, 'System32', name);
+}
+
+/** Windows PowerShell 5.1 (ships with every Windows 10/11; pwsh 7 is optional so it is not used). */
+export function winPowerShellPath() {
+  return winSystemBinary(path.win32.join('WindowsPowerShell', 'v1.0', 'powershell.exe'));
+}
+
+/**
+ * argv that runs `script` in Windows PowerShell. -EncodedCommand (base64 UTF-16LE) avoids every Windows
+ * command-line quoting problem; progress records are silenced so they never reach stderr as CLIXML, and
+ * stdout is UTF-8 so non-ASCII adapter names survive.
+ */
+export function powerShellArgs(script) {
+  const full = "$ProgressPreference='SilentlyContinue';try{[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{};" + script;
+  return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(full, 'utf16le').toString('base64')];
+}
+
+/** One-shot PowerShell call -> stdout. Cold start is ~0.3–1.5 s (more at boot), hence the long timeout. */
+export async function runPowerShell(script, { timeoutMs = 15000, env } = {}) {
+  const { stdout } = await run(winPowerShellPath(), powerShellArgs(script), {
+    timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env: { ...process.env, ...(env || {}) },
+  });
+  return String(stdout || '');
+}
 
 // ------------------------------------------------------------------------------------------------
 // IPv4 helpers
@@ -170,8 +214,116 @@ export function isZeroMac(mac) {
 // Interface / gateway detection
 // ------------------------------------------------------------------------------------------------
 
-export function isExcludedIface(name) {
-  return typeof name !== 'string' || !name || EXCLUDED_IFACE_RE.test(name);
+export function isExcludedIface(name, platform = process.platform) {
+  if (typeof name !== 'string' || !name) return true;
+  return platform === 'win32' ? EXCLUDED_WIN_IFACE_RE.test(name) : EXCLUDED_IFACE_RE.test(name);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Windows default-route parsers (pure, exported for tests)
+// ------------------------------------------------------------------------------------------------
+
+// `route print -4 0.0.0.0` Active Routes rows. Headers are localized, the row layout is not:
+//   '          0.0.0.0          0.0.0.0      192.168.0.1    192.168.0.101     25'
+// The gateway column may be 'On-link' (localized and possibly several words, German 'Auf Verbindung').
+// Persistent Routes rows have no Interface column (4 fields) and never match.
+const WIN_ROUTE_ROW_RE = /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(.+?)\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)\s*$/;
+
+/**
+ * Default routes from `route print -4 0.0.0.0`, lowest effective metric first (stable).
+ * On-link default routes (VPN / tunnel adapters with no next hop) are ignored.
+ * @returns {Array<{gateway:string, ifaceIp:string, metric:number}>}
+ */
+export function parseWinRoutePrint(text) {
+  const rows = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const m = WIN_ROUTE_ROW_RE.exec(line);
+    if (!m) continue;
+    const [, gw, ifaceIp, metric] = m;
+    if (!isValidIpv4(gw) || gw === '0.0.0.0' || !isValidIpv4(ifaceIp)) continue;
+    rows.push({ gateway: gw, ifaceIp, metric: Number(metric) });
+  }
+  return rows.sort((a, b) => a.metric - b.metric);
+}
+
+/**
+ * Default routes from the Get-NetRoute PowerShell fallback: ConvertTo-Json of one object or an array of
+ * { NextHop, InterfaceAlias, InterfaceIndex, RouteMetric, InterfaceMetric, IPAddress }. The effective metric
+ * is RouteMetric + InterfaceMetric (what `route print` shows). NextHop 0.0.0.0 = on-link -> ignored.
+ * @returns {Array<{gateway:string, ifaceIp:string|null, ifaceAlias:string|null, metric:number}>}
+ */
+export function parseWinNetRouteJson(text) {
+  let data;
+  try {
+    data = JSON.parse(String(text || '').replace(/^﻿/, '').trim() || 'null');
+  } catch {
+    return [];
+  }
+  const list = Array.isArray(data) ? data : data && typeof data === 'object' ? [data] : [];
+  const rows = [];
+  for (const r of list) {
+    if (!r || typeof r !== 'object') continue;
+    const gw = r.NextHop;
+    if (!isValidIpv4(gw) || gw === '0.0.0.0') continue;
+    const ip = Array.isArray(r.IPAddress) ? r.IPAddress.find(isValidIpv4) : r.IPAddress;
+    rows.push({
+      gateway: gw,
+      ifaceIp: isValidIpv4(ip) ? ip : null,
+      ifaceAlias: typeof r.InterfaceAlias === 'string' && r.InterfaceAlias ? r.InterfaceAlias : null,
+      metric: (Number(r.RouteMetric) || 0) + (Number(r.InterfaceMetric) || 0),
+    });
+  }
+  return rows.sort((a, b) => a.metric - b.metric);
+}
+
+/** os.networkInterfaces() name that owns IPv4 `ip` ('192.168.0.101' -> 'Wi-Fi'), else null. */
+export function ifaceNameForIp(ip, ifaces = os.networkInterfaces()) {
+  if (!isValidIpv4(ip)) return null;
+  for (const [name, list] of Object.entries(ifaces || {})) {
+    if ((list || []).some((a) => (a.family === 'IPv4' || a.family === 4) && a.address === ip)) return name;
+  }
+  return null;
+}
+
+// Get-NetRoute fallback. ActiveStore only (PersistentStore would duplicate rows); IP and metric of the
+// interface are joined in so the result maps to os.networkInterfaces() by IP, not only by alias.
+const WIN_NETROUTE_PS =
+  "$r=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {" +
+  '$i=$_.InterfaceIndex;' +
+  '[pscustomobject]@{NextHop=$_.NextHop;InterfaceAlias=$_.InterfaceAlias;InterfaceIndex=$i;RouteMetric=$_.RouteMetric;' +
+  'InterfaceMetric=(Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric;' +
+  'IPAddress=@(Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })}' +
+  '} | Sort-Object RouteMetric);ConvertTo-Json -InputObject $r -Compress -Depth 3';
+
+let warnedWinRoute = false;
+
+/** Windows: `route print -4 0.0.0.0`, else PowerShell Get-NetRoute. Interface IPs are mapped to adapter names. */
+async function getWinDefaultRoutes() {
+  const ifaces = os.networkInterfaces();
+  let rows = [];
+  let routeErr = null;
+  try {
+    const { stdout } = await run(winSystemBinary('ROUTE.EXE'), ['print', '-4', '0.0.0.0'], EXEC_OPTS);
+    rows = parseWinRoutePrint(stdout).map((r) => ({ ...r, iface: ifaceNameForIp(r.ifaceIp, ifaces) }));
+  } catch (err) {
+    routeErr = err;
+  }
+  if (!rows.some((r) => r.iface)) {
+    try {
+      const stdout = await runPowerShell(WIN_NETROUTE_PS);
+      rows = parseWinNetRouteJson(stdout).map((r) => ({
+        ...r,
+        iface: ifaceNameForIp(r.ifaceIp, ifaces) ?? (r.ifaceAlias && ifaces[r.ifaceAlias] ? r.ifaceAlias : null),
+      }));
+    } catch (err) {
+      if (!warnedWinRoute) {
+        console.warn(`[sys] Windows default route lookup failed (route.exe: ${routeErr?.message || 'no usable default route'}; ` +
+          `Get-NetRoute: ${err?.message || err}); using the first usable adapter`);
+      }
+      warnedWinRoute = true;
+    }
+  }
+  return rows.filter((r) => r.iface);
 }
 
 /** Usable IPv4 address entries of one interface (non-internal, not link-local unless it is all we have). */
@@ -186,6 +338,8 @@ function ipv4Entries(list) {
  * macOS: `route -n get default` (the route the kernel actually uses) then every `default` row of
  * `netstat -rn -f inet` (so a VPN that owns the default route does not hide the LAN gateway).
  * Linux: `ip -4 route show default` (lowest metric first), fallback /proc/net/route.
+ * Windows: `route print -4 0.0.0.0` (lowest effective metric first, On-link ignored), fallback PowerShell
+ * Get-NetRoute; the interface IP is mapped to its os.networkInterfaces() name ('Ethernet', 'Wi-Fi').
  */
 export async function getDefaultRoutes(platform = process.platform) {
   const routes = [];
@@ -238,6 +392,8 @@ export async function getDefaultRoutes(platform = process.platform) {
         rows.sort((a, b) => a.metric - b.metric).forEach((r) => push(r.gateway, r.iface, r.metric));
       } catch { /* not available */ }
     }
+  } else if (platform === 'win32') {
+    for (const r of await getWinDefaultRoutes()) push(r.gateway, r.iface, r.metric);
   }
   return routes;
 }
@@ -258,7 +414,7 @@ export async function getNetworkInfo() {
     console.warn(`[sys] default route lookup failed: ${err?.message || err}`);
   }
 
-  const candidates = Object.keys(ifaces).filter((name) => !isExcludedIface(name) && ipv4Entries(ifaces[name]).length);
+  const candidates = Object.keys(ifaces).filter((name) => !isExcludedIface(name, platform) && ipv4Entries(ifaces[name]).length);
 
   // 1) interface that owns a (usable) default route, in route preference order
   let iface = null;

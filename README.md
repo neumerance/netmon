@@ -26,8 +26,8 @@ REST and Server-Sent Events (`GET /api/stream`).
 
 ## Requirements
 
-- Node.js **20** or newer (developed on 20.19) and npm 10
-- macOS (primary target) or Linux. No root/sudo and no native modules are needed.
+- Node.js **20** or newer (developed on 20.19) and npm 10; building `NetMon.exe` needs Node 20.12+ (CI uses 22 LTS)
+- macOS, Linux or Windows 10/11 x64 (see [Windows](#windows) for the installer). No root/sudo and no native modules are needed.
 - The computer running NetMon must be on the network you want to monitor (Wi-Fi or Ethernet).
 
 ## Setup
@@ -258,3 +258,104 @@ e2e/               Playwright tests (run against mock mode)
 docs/              PLAN.md (API contract), DESIGN.md (visual system), TOPOLOGY.md (map + detail panel),
                    NETWORK_NOTES.md, FINGERPRINT_NOTES.md (research notes)
 ```
+
+## Windows
+
+NetMon runs on **Windows 10 and 11 (x64)** as a normal Windows service. It does not use Docker or WSL.
+
+### Install
+
+1. Download `NetMon-Setup-<version>.exe` from the [Releases](https://github.com/neumerance/netmon/releases) page.
+   You can check the download against the `.sha256` file next to it: `Get-FileHash .\NetMon-Setup-<version>.exe`.
+2. Run it. The installer is not code-signed, so Windows SmartScreen may show "Windows protected your PC". Click
+   **More info → Run anyway**. Setup needs administrator rights.
+3. On the **Network access** page, choose:
+   - **Allow other devices on your network to open NetMon** (on by default). Turn it off to use NetMon on this PC only.
+   - **Require an access token (recommended)**. Each phone, tablet or other PC opens NetMon once with a link that
+     contains the token. Without a token, anyone on your network can rename or forget devices and change settings.
+   - **Port** (default `4000`, any number from 1024 to 65535).
+4. On the last page, leave **Open NetMon now** ticked. The page also shows the links for this PC and for other devices.
+
+What the installer sets up:
+
+| | |
+|---|---|
+| Program | `C:\Program Files\NetMon\` with `NetMon.exe` (the web app is built in), `NetMonService.exe` ([WinSW](https://github.com/winsw/winsw) v2.12.0, MIT) and `NetMonService.xml` (the service settings) |
+| Service | **NetMon** ("NetMon Network Monitor"). It starts automatically (delayed start) with Windows, even before anyone signs in. If it crashes, Windows restarts it after 5 s (three times), then every 60 s. |
+| Data | `C:\ProgramData\NetMon\` (saved devices, history, settings, map layout). Only Administrators and SYSTEM can change this folder. |
+| Logs | `C:\ProgramData\NetMon\logs\` (`NetMonService.out.log`, `.err.log`, `.wrapper.log`, rolled at 10 MB) |
+| Firewall | Windows Defender Firewall rules for `NetMon.exe`, limited to your local subnet on **Private** and **Domain** networks: inbound TCP on the port (only with LAN access) and the UDP discovery traffic (mDNS 5353, SSDP 1900, NetBIOS 137). Ping and the other checks are outbound and need no rule. |
+| Start Menu | **Open NetMon**, **NetMon logs**, **Uninstall NetMon** |
+
+NetMon must be allowed through Windows Defender Firewall for device discovery and for access from other devices. The
+installer adds the rules. If Windows treats your network as **Public**, the rules do not apply: open
+**Settings → Network & internet → Wi-Fi / Ethernet → (your network)** and choose **Private network**. Other firewall
+products need the same exceptions for `C:\Program Files\NetMon\NetMon.exe`.
+
+### Open NetMon
+
+- On this PC: **Open NetMon** in the Start Menu, or http://localhost:4000.
+- From another device on the same network (with LAN access on): `http://<this-pc-ip>:4000`. Find the IP address with
+  `ipconfig` (the "IPv4 Address" of your Wi-Fi or Ethernet adapter). With an access token, add `/?token=<token>` once
+  per browser. The token is in the Finish page link, in the **Open NetMon** shortcut, and in
+  `C:\Program Files\NetMon\NetMonService.xml` (`NETMON_TOKEN`).
+
+### Change the port or network access
+
+Run the installer again (the same version or a newer one). It shows your current choices, keeps your data and the
+access token, and restarts the service with the new settings. Don't edit `NetMonService.xml` by hand: the installer
+rewrites it.
+
+Unattended install or upgrade:
+
+```powershell
+.\NetMon-Setup-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LAN=1 /TOKEN=1 /PORT=4000
+```
+
+(`/LAN=0` = this PC only. Options you leave out keep their previous values. The defaults are LAN=1 TOKEN=1 PORT=4000.)
+
+### Service commands
+
+Run these in an administrator Command Prompt or PowerShell:
+
+```bat
+sc query NetMon          :: status
+net stop NetMon          :: stop (NetMon saves its data first)
+net start NetMon         :: start
+```
+
+You can also use **Services** (`services.msc`) → *NetMon Network Monitor*.
+
+### Uninstall
+
+Use **Settings → Apps → Installed apps → NetMon → Uninstall** (or **Uninstall NetMon** in the Start Menu). This stops
+and removes the service and the firewall rules. The uninstaller then asks **Also delete NetMon data?** The default is
+**No**, which keeps `C:\ProgramData\NetMon` for a later reinstall. A silent uninstall (`/VERYSILENT`) always keeps the data.
+
+### Build the installer yourself
+
+On Windows with Node.js 22 LTS, Git and [Inno Setup 6.3+](https://jrsoftware.org/isinfo.php):
+
+```powershell
+npm ci; npm --prefix server ci; npm --prefix web ci
+npm run build:exe                                   # -> dist-exe\NetMon.exe
+New-Item -ItemType Directory -Force installer\build | Out-Null
+Invoke-WebRequest https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe -OutFile installer\build\WinSW-x64.exe
+(Get-FileHash installer\build\WinSW-x64.exe).Hash   # 05B82D46AD331CC16BDC00DE5C6332C1EF818DF8CEEFCD49C726553209B3A0DA
+iscc /DAppVersion=1.0.0 installer\netmon.iss        # -> installer\Output\NetMon-Setup-1.0.0.exe
+```
+
+The [Windows workflow](.github/workflows/windows.yml) does the same on every push and pull request. It runs the server
+unit tests and the Playwright e2e tests on Windows, builds and smoke-tests `NetMon.exe`, builds the installer, and
+tests a real install, upgrade and uninstall on the runner. Pushing a tag such as `v1.2.3` publishes
+`NetMon-Setup-1.2.3.exe` and its `.sha256` file as a GitHub Release. `installer/make-icon.mjs` regenerates
+`installer/netmon.ico`.
+
+### Limits on Windows
+
+- The PC must be connected to the network you want to monitor, over Ethernet or Wi-Fi. Only the /24 around its main
+  adapter (the one with the default gateway) is scanned.
+- Windows 10/11 x64 only. On Windows on ARM it runs under x64 emulation (untested). Docker and WSL are not supported:
+  inside them NetMon would see the container's or VM's virtual network, not your LAN.
+- The installer and `NetMon.exe` are not code-signed, so SmartScreen and some antivirus products warn on first run.
+- The service runs as the LocalSystem account (the WinSW default).
