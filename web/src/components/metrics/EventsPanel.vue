@@ -19,6 +19,7 @@ const FILTERS = [
   { key: 'devices', label: 'Devices' },
   { key: 'internet', label: 'Internet' },
   { key: 'speed', label: 'Speed' },
+  { key: 'router', label: 'Router' },
 ];
 const FILTER_KEY = 'netmon.events.filter';
 function loadFilter() {
@@ -45,6 +46,7 @@ function groupOf(type) {
   if (type.startsWith('device_') || type.startsWith('network_')) return 'devices';
   if (type.startsWith('internet_')) return 'internet';
   if (type.startsWith('speedtest_')) return 'speed';
+  if (type.startsWith('router_')) return 'router';
   return 'other';
 }
 
@@ -75,7 +77,7 @@ const allEvents = computed(() => {
 const visible = computed(() => (filter.value === 'all' ? allEvents.value : allEvents.value.filter((e) => groupOf(e.type) === filter.value)));
 
 const counts = computed(() => {
-  const c = { all: allEvents.value.length, devices: 0, internet: 0, speed: 0 };
+  const c = { all: allEvents.value.length, devices: 0, internet: 0, speed: 0, router: 0 };
   for (const e of allEvents.value) {
     const g = groupOf(e.type);
     if (g in c) c[g] += 1;
@@ -116,6 +118,12 @@ const KIND = {
   server_started: { icon: 'zap', tint: 'neutral' },
   network_scan: { icon: 'radar', tint: 'info' },
   network_changed: { icon: 'network', tint: 'accent' },
+  router_wan_down: { icon: 'wifi-off', tint: 'warning' },
+  router_wan_up: { icon: 'router', tint: 'success' },
+  router_snmp_ok: { icon: 'router', tint: 'info' },
+  router_snmp_error: { icon: 'alert-triangle', tint: 'warning' },
+  router_syslog_error: { icon: 'alert-triangle', tint: 'warning' },
+  router_log_critical: { icon: 'alert-octagon', tint: 'warning' },
 };
 const TINT = {
   danger: 'bg-danger/15 text-danger-fg',

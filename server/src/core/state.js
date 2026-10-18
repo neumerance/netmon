@@ -28,6 +28,7 @@ export function createState({ store, timings, eventLog, mock = false }) {
   let alertsSig = alertsKey(alerts);
   let deviceSource = { list: () => [], get: () => null };
   let topologySource = null; // () => { [mac]: Override } (core/topology.js store), set by index.js
+  let routerSource = null; // () => router snapshot (router/monitor.js), set by index.js
 
   const broadcast = (type, data) => {
     try { state.emit('broadcast', type, data); } catch (err) { console.warn(`[state] broadcast ${type} failed: ${err.message}`); }
@@ -46,8 +47,14 @@ export function createState({ store, timings, eventLog, mock = false }) {
     return { overrides };
   };
 
+  // ---------------------------------------------------------------- router integration
+  state.setRouterSource = (fn) => { routerSource = typeof fn === 'function' ? fn : null; };
+  state.getRouter = () => {
+    try { return routerSource?.() ?? null; } catch (err) { console.warn(`[state] router source failed: ${err.message}`); return null; }
+  };
+
   // ---------------------------------------------------------------- network
-  state.getNetwork = () => (network ? { ...network } : null);
+  state.getNetwork =() => (network ? { ...network } : null);
   /** Set the NetworkInfo. `reset` (network change): scan bookkeeping starts over (firstScanDone false). */
   state.setNetworkInfo = (info, { reset = false } = {}) => {
     if (!info) { network = null; broadcast('network', null); return; }
@@ -155,6 +162,7 @@ export function createState({ store, timings, eventLog, mock = false }) {
     settings: store.getSettings(),
     events: eventLog.list(SNAPSHOT_EVENTS),
     topology: state.getTopology(),
+    router: state.getRouter(),
   });
 
   state.broadcast = broadcast;

@@ -7,7 +7,8 @@
 //      <data dir>/netmon.json, see core/paths.js; env vars always win),
 //      NETMON_ALLOW_LAN=1 (required to bind a non-loopback HOST without a token),
 //      NETMON_TOKEN (shared secret required on every /api request; recommended with a LAN HOST),
-//      NETMON_ALLOWED_HOSTS (comma-separated extra Host names, e.g. a reverse-proxy name).
+//      NETMON_ALLOWED_HOSTS (comma-separated extra Host names, e.g. a reverse-proxy name),
+//      NETMON_SNMP_COMMUNITY (router SNMP community; overrides the one saved in the dashboard).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,6 +26,8 @@ import { createApiGuard, isLoopbackHost } from './core/guard.js';
 import { createTopologyStore, MOCK_DEFAULT_OVERRIDES } from './core/topology.js';
 import { resolveRuntime } from './core/paths.js';
 import { createEmbeddedStatic } from './core/embeddedStatic.js';
+import { createRouterStore } from './core/routerStore.js';
+import { createRouterMonitor } from './router/monitor.js';
 
 const VERSION = '1.0.0';
 process.title = 'NetMon';
@@ -40,7 +43,7 @@ if (cliArgs.includes('--help') || cliArgs.includes('-h')) {
 Usage: netmon [--version] [--help]
 
 Configuration: environment variables. The packaged executable also reads an optional netmon.json
-({"port", "host", "token", "allowLan", "allowedHosts", "dataDir"}) next to the executable and in the data
+({"port", "host", "token", "allowLan", "allowedHosts", "dataDir", "snmpCommunity"}) next to the executable and in the data
 directory; environment variables always win.
   PORT                  HTTP port (default 4000)
   HOST                  bind address (default 127.0.0.1; 0.0.0.0 needs NETMON_TOKEN or NETMON_ALLOW_LAN=1)
@@ -49,6 +52,7 @@ directory; environment variables always win.
   NETMON_ALLOWED_HOSTS  comma-separated extra Host header names
   NETMON_DATA_DIR       data directory
   NETMON_CONFIG         explicit path of a netmon.json config file
+  NETMON_SNMP_COMMUNITY router SNMP v2c community (overrides the one saved in the dashboard)
   NETMON_MOCK=1         mock mode (simulated network)`);
   process.exit(0);
 }
@@ -81,7 +85,7 @@ process.on('uncaughtException', (err) => {
 /** Load the implementation modules (dynamic imports so mock mode never loads real network code). */
 async function loadImpl() {
   if (MOCK) return import('./mock/index.js');
-  const [sys, discovery, pinger, throughput, fingerprint, probe, speedtest, isp] = await Promise.all([
+  const [sys, discovery, pinger, throughput, fingerprint, probe, speedtest, isp, syslog, snmp] = await Promise.all([
     import('./net/sys.js'),
     import('./net/discovery.js'),
     import('./net/pinger.js'),
@@ -90,6 +94,8 @@ async function loadImpl() {
     import('./internet/probe.js'),
     import('./internet/speedtest.js'),
     import('./internet/isp.js'),
+    import('./router/syslog.js'),
+    import('./router/snmp.js'),
   ]);
   return {
     getNetworkInfo: sys.getNetworkInfo,
@@ -101,6 +107,9 @@ async function loadImpl() {
     runSpeedTest: speedtest.runSpeedTest,
     fetchIsp: isp.fetchIsp,
     tcpPresence: pinger.tcpPresence,
+    createSyslogReceiver: syslog.createSyslogReceiver,
+    createSnmpClient: snmp.createSnmpClient,
+    pollRouter: snmp.pollRouter,
   };
 }
 
@@ -179,6 +188,20 @@ async function main() {
 
   const sseHub = createSseHub({ getSnapshot: () => state.getSnapshot() });
   state.on('broadcast', (type, data) => sseHub.broadcast(type, data));
+
+  // Router integration (syslog receiver + SNMP poller): off until enabled in the dashboard. Config and the
+  // received log live in <dataDir>/router.json and router-log.json.
+  const routerStore = createRouterStore({ dataDir: DATA_DIR, env: ENV });
+  routerStore.load();
+  const routerMonitor = createRouterMonitor({
+    routerStore, eventLog,
+    broadcast: (type, data) => state.broadcast(type, data),
+    getGateway: () => state.getNetwork()?.gateway ?? null,
+    createSyslogReceiver: impl.createSyslogReceiver,
+    createSnmpClient: impl.createSnmpClient,
+    pollRouter: impl.pollRouter,
+  });
+  state.setRouterSource(() => routerMonitor.getSnapshot());
 
   // Mock: seed speed history when empty (boot and after reset).
   const seedHistoryIfEmpty = () => {
@@ -301,6 +324,7 @@ async function main() {
       devices.onNetworkChanged();
       createLan(next);
       if (fingerprinter?.setNetwork) safeCall('fingerprinter.setNetwork', () => fingerprinter.setNetwork(next));
+      safeCall('routerMonitor.apply', () => routerMonitor.apply()); // the default gateway may have changed
       eventLog.add({
         type: 'network_changed', level: 'info',
         message: cur ? `Network changed: now on ${next.iface} ${next.cidr}` : `Network found: ${next.iface} ${next.cidr}`,
@@ -322,6 +346,8 @@ async function main() {
       speed.abort(); // also drops a pending startup test
       store.resetAll();
       topology.reset({ scope: 'all' }); // back to the mock "Connected via" defaults, no pinned positions
+      routerStore.reset(); // router integration off, empty router log
+      await routerMonitor.apply();
       devices.reset();
       state.resetAlerts();
       seedHistoryIfEmpty();
@@ -366,7 +392,7 @@ async function main() {
   }
   app.use('/api', createApiGuard({ host: HOST, allowLan: !LOOPBACK_BIND, token: TOKEN, extraHosts: EXTRA_HOSTS }));
   app.use('/api', createApiRouter({
-    state, store, devices, speed, eventLog, sseHub, topology, mock: MOCK, version: VERSION,
+    state, store, devices, speed, eventLog, sseHub, topology, routerStore, routerMonitor, mock: MOCK, version: VERSION,
     applyMockState: MOCK ? applyMockState : null,
     onSettingsChanged: (prev, next, changedKeys) => {
       if (changedKeys.includes('speedTestIntervalMin')) speed.reschedule();
@@ -417,6 +443,7 @@ async function main() {
     if (mod) safeCall(`${name}.start`, () => mod.start());
   }
   lanStarted = true;
+  safeCall('routerMonitor.apply', () => routerMonitor.apply());
   netTimer = setInterval(checkNetwork, timings.networkCheckMs || 15000);
   netTimer.unref?.();
   speed.start();
@@ -444,15 +471,18 @@ async function main() {
       ['discovery', discovery], ['fingerprinter', fingerprinter]]) {
       if (mod) safeCall(`${name}.stop`, () => mod.stop());
     }
+    safeCall('routerMonitor.stop', () => routerMonitor.stop());
     sseHub.closeAll();
     store.flush();
     topology.flush();
+    routerStore.flush();
     server.close();
     // A PUT/DELETE /api/topology (or a device save) on a still-open keep-alive connection can land after
     // the flush above and only schedule a debounced write; flush again right before exiting.
     setTimeout(() => {
       try { store.flush(); } catch { /* ignore */ }
       try { topology.flush(); } catch { /* ignore */ }
+      try { routerStore.flush(); } catch { /* ignore */ }
       process.exit(0);
     }, 300).unref();
   };

@@ -32,6 +32,13 @@ function defaultSettings() {
   return { speedThresholdMbps: 200, speedTestIntervalMin: 15, soundAlerts: true, activeFingerprinting: true };
 }
 
+const ROUTER_LOG_CAP = 500;
+
+/** Router integration (syslog + SNMP). `available` is false against an older server without /api/router. */
+function defaultRouter() {
+  return { available: false, config: null, status: null, ports: [], log: [] };
+}
+
 export const state = reactive({
   loaded: false,
   connection: 'connecting', // 'connecting' | 'open' | 'reconnecting'
@@ -47,6 +54,7 @@ export const state = reactive({
   events: [],
   toasts: [],
   topology: { overrides: {} }, // TOPOLOGY.md §7: { [mac]: { parentMac, position, updatedAt } }
+  router: defaultRouter(),
   // ---- extras (not in PLAN §8.1, additive) ----
   lastMessageAt: null, // ms epoch of the last SSE message (or snapshot)
   disconnectedAt: null, // ms epoch when the connection last dropped; null while open
@@ -353,6 +361,9 @@ function applySnapshot(s) {
   state.alerts = Array.isArray(s.alerts) ? s.alerts : [];
   state.settings = { ...defaultSettings(), ...(s.settings || {}) };
   state.events = Array.isArray(s.events) ? s.events.slice(0, EVENTS_CAP) : [];
+  state.router = s.router && typeof s.router === 'object'
+    ? { ...defaultRouter(), ...s.router, available: true, log: Array.isArray(s.router.log) ? s.router.log.slice(0, ROUTER_LOG_CAP) : [] }
+    : defaultRouter();
   if (s.topology && typeof s.topology === 'object') {
     setServerTopology(s.topology.overrides);
   } else if (!topologyFetched) {
@@ -417,6 +428,16 @@ export function applyStreamEvent(type, data) {
       break;
     case 'topology':
       setServerTopology(data?.overrides);
+      break;
+    case 'router':
+      if (data && typeof data === 'object') applyRouterState(data);
+      break;
+    case 'routerLog':
+      if (data?.cleared) state.router.log = [];
+      else if (data?.id && !state.router.log.some((e) => e.id === data.id)) {
+        state.router.log.unshift(data);
+        if (state.router.log.length > ROUTER_LOG_CAP) state.router.log.length = ROUTER_LOG_CAP;
+      }
       break;
     default:
       break;
@@ -556,6 +577,39 @@ export async function updateSettings(patch) {
   } catch (err) {
     if (!(err instanceof ApiError && err.status === 400)) errorToast(err, "Couldn't save settings");
     throw err;
+  }
+}
+
+function applyRouterState({ config, status, ports }) {
+  state.router.available = true;
+  if (config) state.router.config = config;
+  if (status) state.router.status = status;
+  if (Array.isArray(ports)) state.router.ports = ports;
+}
+
+/** PUT /api/router/config with a partial { syslog?, snmp? }. Validation errors (400) are rethrown untoasted. */
+export async function updateRouterConfig(patch) {
+  try {
+    const res = await api.updateRouterConfig(patch);
+    if (res && typeof res === 'object') applyRouterState(res);
+    return state.router;
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 400)) errorToast(err, "Couldn't save router settings");
+    throw err;
+  }
+}
+
+/** One-off SNMP check: resolves { ok, host, system?, ports?, error? }. */
+export function testRouterSnmp(body = {}) {
+  return api.testRouterSnmp(body);
+}
+
+export async function clearRouterLog() {
+  try {
+    await api.clearRouterLog();
+    state.router.log = [];
+  } catch (err) {
+    errorToast(err, "Couldn't clear the router log");
   }
 }
 

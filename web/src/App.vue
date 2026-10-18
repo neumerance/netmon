@@ -13,14 +13,18 @@ import SpeedHistoryChart from './components/metrics/SpeedHistoryChart.vue';
 import LocalThroughputCard from './components/metrics/LocalThroughputCard.vue';
 import EventsPanel from './components/metrics/EventsPanel.vue';
 import DevicesPanel from './components/devices/DevicesPanel.vue';
+import RouterPanel from './components/router/RouterPanel.vue';
 import Icon from './components/ui/Icon.vue';
 import Button from './components/ui/Button.vue';
 import Skeleton from './components/ui/Skeleton.vue';
 import { state, ui, init, runSpeedTest } from './store.js';
 import { useStream } from './composables/useStream.js';
+import { useWakeLock } from './composables/useWakeLock.js';
 import { formatTime } from './lib/format.js';
 
 const stream = useStream();
+// Keep the screen from dimming or sleeping while the dashboard is open.
+useWakeLock();
 
 onMounted(() => {
   init();
@@ -97,8 +101,9 @@ const lastUpdate = computed(() => (stream.lastUpdateAt.value ? formatTime(stream
             <DevicesPanel />
           </div>
 
-          <div class="min-w-0 xl:col-start-1 xl:row-start-3">
+          <div class="flex min-w-0 flex-col gap-4 xl:col-start-1 xl:row-start-3 xl:gap-5">
             <SpeedHistoryChart />
+            <RouterPanel />
           </div>
 
           <aside class="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-2" aria-label="Events">

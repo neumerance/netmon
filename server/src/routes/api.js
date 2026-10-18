@@ -4,6 +4,7 @@ import express from 'express';
 import { normalizeMac } from '../net/sys.js';
 import { validateSettings } from '../core/settings.js';
 import { mountTopologyRoutes } from './topology.js';
+import { mountRouterRoutes } from './router.js';
 
 // Pinned in PLAN §2.6 / §4.8 (kept locally so the API layer does not depend on the fingerprint package).
 export const CATEGORIES = ['computer', 'laptop', 'phone', 'tablet', 'router', 'access_point', 'network_switch', 'tv',
@@ -72,6 +73,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
  * @param {(patch: object) => object} [ctx.applyMockState]  mock mode only; returns MockState
  * @param {() => void} ctx.onSettingsChanged  (prev, next) hook for rescheduling etc.
  * @param {object} [ctx.topology]  core/topology.js store; mounts GET/PUT/DELETE /topology when present
+ * @param {object} [ctx.routerStore, ctx.routerMonitor]  router integration; mounts /router/* when present
  */
 export function createApiRouter(ctx) {
   const { state, store, devices, speed, eventLog, sseHub, mock, version } = ctx;
@@ -207,6 +209,11 @@ export function createApiRouter(ctx) {
 
   // --------------------------------------------------------------- topology (docs/TOPOLOGY.md §7.2)
   if (ctx.topology) mountTopologyRoutes(router, { state, store, devices, topology: ctx.topology });
+
+  // --------------------------------------------------------------- router integration (syslog + SNMP)
+  if (ctx.routerMonitor) {
+    mountRouterRoutes(router, { routerStore: ctx.routerStore, monitor: ctx.routerMonitor, eventLog, broadcast: state.broadcast });
+  }
 
   // --------------------------------------------------------------- fallbacks
   router.use((req, res) => sendError(res, 404, 'not_found', `No route for ${req.method} /api${req.path}`));

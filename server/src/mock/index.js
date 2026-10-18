@@ -7,6 +7,7 @@ export { createFingerprinter } from './fingerprint.js';
 export { createProbe, runSpeedTest, fetchIsp, seedSpeedHistory } from './internet.js';
 export { applyMockState, getMockState, resetMockState, validateMockPatch } from './state.js';
 export { MOCK_DEVICES, MOCK_NEW_DEVICE, MOCK_NETWORK, MOCK_ISP } from './devices.js';
+export { createSyslogReceiver, createSnmpClient, pollRouter } from './router.js';
 
 /** PLAN.md §6.6 */
 export const MOCK_TIMINGS = Object.freeze({

@@ -59,6 +59,7 @@ const CONFIG_KEYS = {
   token: 'NETMON_TOKEN',
   allowLan: 'NETMON_ALLOW_LAN',
   allowedHosts: 'NETMON_ALLOWED_HOSTS',
+  snmpCommunity: 'NETMON_SNMP_COMMUNITY',
 };
 
 function readConfigFile(file) {

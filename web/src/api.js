@@ -90,10 +90,19 @@ export const api = {
   topology: () => request('GET', '/topology'),
   updateTopology: (mac, body) => request('PUT', `/topology/${enc(mac)}`, body),
   resetTopology: (scope = 'positions') => request('DELETE', `/topology?scope=${encodeURIComponent(scope)}`),
+  // Router integration: syslog receiver + SNMP poller (the community is write-only).
+  router: () => request('GET', '/router'),
+  updateRouterConfig: (patch) => request('PUT', '/router/config', patch),
+  routerLog: ({ limit = 500, severity = 7, q = '' } = {}) =>
+    request('GET', `/router/log?limit=${encodeURIComponent(limit)}&severity=${encodeURIComponent(severity)}&q=${encodeURIComponent(q)}`),
+  clearRouterLog: () => request('DELETE', '/router/log'),
+  // The server waits up to 2.5 s for the router; give it headroom.
+  testRouterSnmp: (body) => request('POST', '/router/snmp/test', body, { timeoutMs: 8000 }),
 };
 
 /** SSE event names emitted by the server (PLAN §5). */
-export const STREAM_EVENTS = ['snapshot', 'devices', 'device', 'internet', 'speed', 'isp', 'alerts', 'event', 'settings', 'network', 'topology'];
+export const STREAM_EVENTS = ['snapshot', 'devices', 'device', 'internet', 'speed', 'isp', 'alerts', 'event', 'settings', 'network', 'topology',
+  'router', 'routerLog'];
 
 /**
  * Open the SSE stream with automatic reconnect.

@@ -18,6 +18,9 @@ watches your internet connection, and streams it all live to a Vue 3 + Tailwind 
   and your ISP (name, ASN, public IP, location).
 - **Alarms**: a red on-screen alarm (plus optional sound and desktop notification) when the internet goes down,
   and a warning when the measured download speed drops below a threshold (default **200 Mbps**).
+- **Router integration** (optional, off by default): per-port status and throughput from your router over **SNMP**
+  (including the WAN link), and the router's own log over **syslog**, with events when the WAN goes down or comes back.
+  See [Router integration](#router-integration).
 
 Browsers cannot scan a local network, so the backend does all of the network work. The web app talks to it over
 REST and Server-Sent Events (`GET /api/stream`).
@@ -70,6 +73,7 @@ First-time Playwright setup: `npx playwright install chromium`.
 | `NETMON_ALLOWED_HOSTS` | unset | Comma-separated extra host names accepted in the `Host` header (e.g. a reverse-proxy name). |
 | `NETMON_MOCK` | unset | `1` = mock mode (see below) |
 | `NETMON_DATA_DIR` | `server/data` | Where `store.json` (saved devices, history, events, settings) is kept |
+| `NETMON_SNMP_COMMUNITY` | unset | Router SNMP v2c community. Overrides the one saved in the dashboard (`snmpCommunity` in `netmon.json`). |
 
 **Request protection.** Every `/api` request must address NetMon by `localhost`, a loopback IP, the configured
 `HOST` (or, with a LAN `HOST`, one of this machine's addresses / names), so a DNS-rebinding page cannot reach it.
@@ -131,6 +135,48 @@ right after the `200` all mock devices are listed with their final type. A reset
 
 Use a separate `NETMON_DATA_DIR` for mock mode if you don't want to mix mock data with your real saved devices.
 
+## Router integration
+
+NetMon can read two things straight from your router using standard protocols, so it works with any router that
+supports them (most prosumer and open-source router firmware does; many ISP-supplied routers do not). Both are off until
+you turn them on in the **Router** card (**Set up**, or the gear icon once it is on). Settings are stored in `router.json`
+in the data directory.
+
+**Port traffic (SNMP v2c).** NetMon polls the standard interface tables (IF-MIB, 64-bit counters when the router has them)
+every 10 s by default and shows each port's link status, speed and in/out rate. The **internet port** is the interface
+that carries the router's default route (read from the standard route tables); when the router does not publish a route
+table, ports named like `wan`, `ppp*`, `internet`, `uplink`, `wwan`, `lte` or `dsl` are used instead. The internet
+port going down or up is logged as an event.
+
+1. In your router's admin page, enable SNMP v2c with a read-only community. Pick your own; don't use `public`.
+2. In NetMon, turn on **Port traffic**, enter the same community, then press **Test connection** and **Save**.
+   Leave **Router address** empty to use the default gateway.
+
+The community is stored in `router.json` (mode 0600) on this computer and is never sent back to the browser. To keep it
+out of that file, set `NETMON_SNMP_COMMUNITY` (or `snmpCommunity` in `netmon.json`) instead.
+
+**Router log (syslog).** NetMon listens for syslog (RFC 3164, RFC 5424 and the bare `<PRI>message` form) on **UDP 514**
+by default and keeps the last 2000 lines. Lines saying that the WAN / PPP / uplink / internet link went down or came back,
+and critical lines, also show up in **Events**.
+
+1. In your router's admin page, find the remote logging setting (often called *Remote log*, *Syslog server* or *Send log*)
+   and set the server to the address of the computer running NetMon. Many routers can only send to port 514; if yours lets
+   you choose, any port works as long as NetMon uses the same one.
+2. Give that computer a DHCP reservation on the router, so the address does not change.
+3. In NetMon, turn on **Router log**.
+
+Only datagrams from the router are accepted: the default gateway, or the address in **Accept messages from**. The card
+shows how many messages were ignored and where they came from, in case the router sends from another address.
+
+Notes:
+
+- The syslog listener binds `0.0.0.0` (it has to receive from the router) even when the web UI only listens on `127.0.0.1`.
+  On macOS, allow incoming connections for `node` (or NetMon) if the firewall asks.
+- Port 514 needs no special rights on macOS or Windows. On Linux, ports below 1024 need root, or
+  `sudo setcap cap_net_bind_service=+ep $(which node)`.
+- `npm run dev:mock` simulates a generic router with five ports and a stream of log lines, so you can try the card
+  without a router.
+
 ## API overview
 
 All endpoints are under `/api` and return JSON. Errors look like `{ "error": "<code>", "message": "..." }`.
@@ -139,7 +185,7 @@ All endpoints are under `/api` and return JSON. Errors look like `{ "error": "<c
 |---|---|
 | `GET /api/health` | Liveness, mode, uptime, number of live clients |
 | `GET /api/snapshot` | Everything the dashboard needs in one document |
-| `GET /api/stream` | Server-Sent Events: `snapshot`, `devices`, `device`, `internet`, `speed`, `isp`, `alerts`, `event`, `settings`, `network`, `topology` |
+| `GET /api/stream` | Server-Sent Events: `snapshot`, `devices`, `device`, `internet`, `speed`, `isp`, `alerts`, `event`, `settings`, `network`, `topology`, `router`, `routerLog` |
 | `GET /api/devices` | Current device list |
 | `PUT /api/devices/:mac` | Save / rename a device: `{ "name": "Living room PC", "type": null, "notes": "" }` (`type` = a category id to override detection, `null` = auto) |
 | `DELETE /api/devices/:mac` | Forget a saved device (an offline device also loses its map layout entry) |
@@ -151,6 +197,11 @@ All endpoints are under `/api` and return JSON. Errors look like `{ "error": "<c
 | `GET /api/topology` | Map layout overrides: `{ "overrides": { "<mac>": { "parentMac", "position", "updatedAt" } } }` (also in the snapshot as `topology`) |
 | `PUT /api/topology/:mac` | Set "Connected via" and/or a pinned map position: `{ "parentMac": "50:c7:bf:3d:7e:06" \| null, "position": { "x": 120, "y": -40 } \| null }` (`null` parent = the gateway; the parent must be an access point, mesh node, switch or secondary router; no loops; coordinates within ±10000) |
 | `DELETE /api/topology?scope=positions\|all` | Reset the map: `positions` (default) unpins every node, `all` also resets every "Connected via" (to the mock defaults in mock mode) |
+| `GET /api/router` | Router integration: `{ config, status, ports }` (also in the snapshot as `router`, with the newest 200 log lines). The SNMP community is never returned, only `communitySet` |
+| `PUT /api/router/config` | Partial `{ "syslog": { "enabled", "port", "source" }, "snmp": { "enabled", "host", "community", "intervalSec" } }`. `source` / `host` are IPv4 or `""` for the default gateway; `port` 1–65535; `intervalSec` 5–300 |
+| `GET /api/router/log?limit=200&severity=7&q=` | Received router log, newest first (`severity` 0–7 keeps lines at least that severe, e.g. `4` = warnings and worse) |
+| `DELETE /api/router/log` | Clear the router log |
+| `POST /api/router/snmp/test` | One-off SNMP check: optional `{ "host", "community" }` override the saved values → `{ ok, host, system, ports }` or `{ ok: false, error }` |
 
 MACs in URLs may use colons or dashes, in any case (`a4-83-e7-1c-2d-01`).
 
@@ -218,10 +269,14 @@ directory, with the same write, backup and recovery rules. Layout entries for de
 returns to its place when it comes back. Forgetting a device that is offline (it then disappears from the list) also drops its
 layout entry. The gateway is a fixed anchor and cannot be given a pinned position.
 
+Router integration settings are kept in `router.json` and the last 2000 router log lines in `router-log.json` (written at
+most every 10 s), both in the same directory and mode 0600.
+
 ## Limitations
 
-- **Per-device network speed (throughput) needs router integration.** A normal computer on the LAN cannot see other
-  devices' traffic, so for other devices NetMon shows **connection quality** (latency, jitter, packet loss) instead.
+- **Per-device network speed (throughput) is not available.** A normal computer on the LAN cannot see other
+  devices' traffic, and SNMP only gives per-**port** totals on the router, so for other devices NetMon shows
+  **connection quality** (latency, jitter, packet loss) instead.
   Real live download/upload rates are shown **for this computer only**, read from its interface counters.
   In the table, other devices show "—" with the tooltip "Requires router integration".
 - **Offline detection lag for devices that ignore ping.** Some devices, such as Windows PCs with the default firewall, never answer ICMP.
@@ -250,6 +305,7 @@ server/            Node 20 ESM backend (Express)
   src/net/         LAN: interface/gateway, discovery, pinger, throughput, OUI vendors
   src/net/fingerprint/  device-type detection (mDNS, SSDP, NetBIOS, ports, hostname, vendor, Apple models)
   src/internet/    connectivity probe, Cloudflare speed test, ISP lookup
+  src/router/      router integration: SNMPv2c client + IF-MIB poll, syslog receiver, monitor
   src/mock/        deterministic mock implementations (NETMON_MOCK=1)
 web/               Vue 3 + Vite + Tailwind CSS v4 dashboard
 e2e/               Playwright tests (run against mock mode)
